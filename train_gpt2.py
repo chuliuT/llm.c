@@ -36,7 +36,7 @@ import torch.distributed as dist
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the GPT-2 model
-
+####GPT-2原始仓库的 gelu实现 https://github.com/openai/gpt-2/blob/master/src/model.py
 class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
     def forward(self, input):
@@ -50,14 +50,21 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
+        ## batch维度的  qkv 所有的head 都对应一个 qkv 的矩阵，维度变化
+        # (B, T, C) -> (B, T, 3*C) 
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        #做一次线性投影
+        #(B, T, C) -> (B, T, C) 
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
         # regularization
+        # 注意力头的数量
         self.n_head = config.n_head
+        # 编码的词向量维度
         self.n_embd = config.n_embd
+        #生成一个mask矩阵，用于attention 左下角为1 右上角为0
         # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
@@ -65,28 +72,40 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
+        qkv = self.c_attn(x)  ## (B, T, 3*C)
+        q, k, v = qkv.split(self.n_embd, dim=2)## qkv拆分tensor
+        ### 将C维度拆分，变成n_head个head，View形状为(B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         if FLASH:
+            #直接调用pytorch的flashattention
             # flashattention
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         else:
             # manual implementation of attention
             # this materializes the large (T,T) matrix for all the queries and keys
+            # q和k 做 attention  得到 （B, nh, T, T) attention矩阵 做了 K size的归一化
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            #这个Python代码的作用是使用masked_fill函数将att张量中满足self.bias[:,:,:T,:T] == 0条件的元素填充为负无穷大（float('-inf')）。
+            # 具体来说，它通过将self.bias张量的前T个元素与att张量进行比较，将满足条件的位置置为负无穷大，从而实现对att张量的修改。
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # 计算softmax 
             att = F.softmax(att, dim=-1)
+            #将 attention 矩阵和v矩阵相乘
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # (B, nh, T, hs) -> (B, T, nh,hs) -> (B, T, C)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-        # output projection
+        # output projection 
+        #(B,T,C) ->(B,T,C)
         y = self.c_proj(y)
         return y
 
 class MLP(nn.Module):
-
+    """
+    MLP forward B,T,C -> B,T,4C  ->act -> B,T,4C -> B,T,C
+    线性层-> gelu -> 线性层
+    """
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
@@ -101,7 +120,10 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-
+    """
+    Layernorm -> Attention -> LayerNorm -> MLP
+    注意 中间的 残差链接
+    """
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
@@ -116,7 +138,14 @@ class Block(nn.Module):
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
-
+# ----------------------------------------------------------------------------- 
+# gpt2的配置表
+#该代码定义了一个名为GPTConfig的类，用于配置GPT模型的超参数。类中有五个属性，分别是：
+# block_size：一个整数，表示每个输入序列的长度，默认值为1024。
+# vocab_size：一个整数，表示词汇表的大小，默认值为50257。
+# n_layer：一个整数，表示模型的层数，默认值为12。
+# n_head：一个整数，表示多头注意力的头数，默认值为12。
+# n_embd：一个整数，表示词嵌入的维度，默认值为768。
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -132,20 +161,35 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
+            ## 词嵌入 词向量编码
             wte = nn.Embedding(config.vocab_size, config.n_embd),
+            ## 位置嵌入 位置变量编码 
             wpe = nn.Embedding(config.block_size, config.n_embd),
+            ## transformer的堆叠block 
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ##最后一个层归一化
             ln_f = nn.LayerNorm(config.n_embd),
         ))
+        #  最后一个 线性层，用于分类用
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.LLMC_SKIP_INIT = 1 # don't init this one, we will tie weights
+        # 词向量和 最后一个head 线性层的权重共享
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
         # init all weights, use a torch rng object to be very careful
+        ## 随机数种子
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(42)
+        # 权重初始化
         self.apply(self._init_weights)
 
+    # 该函数用于初始化神经网络模型的权重。具体来说，它会对模型的不同组件进行不同方式的权重初始化。
+    # 如果组件是nn.Linear类型的：
+    # 根据GPT-2论文中的特殊缩放初始化方法，设定权重的标准差(std)为0.02。如果组件具有'LLMC_RESIDUAL_SCALE_FLAG'属性，则标准差会除以2 * self.config.n_layer的平方根。
+    # 如果组件不具有'LLMC_SKIP_INIT'属性，使用均值为0.0，标准差为计算得到的std的高斯分布对权重进行初始化。
+    # 如果该组件有偏置项，则将偏置项初始化为零向量。
+    # 如果组件是nn.Embedding类型的：
+    # 使用均值为0.0，标准差为0.02的高斯分布对权重进行初始化。
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             # apply special scaled init to the residual projections, per GPT-2 paper
@@ -161,25 +205,35 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None, return_logits=True):
         device = idx.device
-        b, t = idx.size()
+        b, t = idx.size()# batch size, sequence length
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        # 生成位置变量
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
         # forward the GPT model itself
+        # 词嵌入
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        # 位置嵌入
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        # 词嵌入和位置嵌入相加，融合
         x = tok_emb + pos_emb
 
+        ## 多层block 堆叠 抽取语义
         for block in self.transformer.h:
             x = block(x)
+        ## 最后一个层归一化
         x = self.transformer.ln_f(x)
 
-        if targets is not None:
+        if targets is not None:## training 计算loss
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
+            ## 
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
+            ## 该函数的功能是从给定的输入张量 x 中获取最后一个时间步的输出，并将其作为 logits 返回。
+            # 具体来说，x[:, [-1], :] 表示选取 x 中所有行的最后一个时间步（由 [-1] 指定），并保持时间维度不变。
+            # 然后，self.lm_head 被用来对选取的部分进行处理，并返回结果作为 logits。
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
 
@@ -191,74 +245,109 @@ class GPT(nn.Module):
 
     @classmethod
     def from_pretrained(cls, model_type):
-        """Loads pretrained GPT-2 model weights from huggingface"""
+        """
+        从Hugging Face加载预训练的GPT-2模型权重。
+        
+        参数:
+        model_type (str): 模型类型，支持'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'。
+        
+        返回:
+        model: 初始化的GPT模型。
+        """
+        # 确保model_type是支持的类型之一
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        # 导入GPT2LMHeadModel类
         from transformers import GPT2LMHeadModel
+        # 打印加载的模型类型
         print("loading weights from pretrained gpt: %s" % model_type)
 
-        # n_layer, n_head and n_embd are determined from model_type
+        # 根据模型类型设置配置参数
         config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M参数
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M参数
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M参数
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M参数
         }[model_type]
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        # create a from-scratch initialized minGPT model
+        # GPT模型词汇表大小固定为50257
+        config_args['vocab_size'] = 50257 
+        # GPT模型的块大小固定为1024
+        config_args['block_size'] = 1024 
+        # 创建一个从头开始初始化的minGPT模型
         config = GPTConfig(**config_args)
         model = GPT(config)
+        # 获取模型的状态字典
         sd = model.state_dict()
         sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+        # 过滤掉不需要的参数
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
 
-        # init a huggingface/transformers model
+        # 初始化一个Hugging Face的GPT2LMHeadModel模型
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
 
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
+        # 确保两个模型的参数名称和形状都对齐
         sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+        # 需要转置的权重参数
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
+        # 确保两个模型的参数数量匹配
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        # 复制参数
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
+                # 对需要转置的权重进行特殊处理
                 assert sd_hf[k].shape[::-1] == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k].t())
             else:
-                # vanilla copy over the other parameters
+                # 直接复制其他参数
                 assert sd_hf[k].shape == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
 
+        # 返回加载了预训练权重的模型
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage):
-        # start with all of the candidate parameters
+        """
+        配置优化器参数。
+
+        根据参数属性，如是否需要梯度、参数维度等，将模型参数分组并配置相应的优化器。
+        
+        参数:
+            weight_decay (float): 权重衰减（L2正则化）系数。
+            learning_rate (float): 学习率。
+            betas (tuple): Adam优化器的beta参数。
+            device_type (str): 设备类型，如'cuda'或'cpu'。
+            zero_stage (int): Zero冗余优化器的阶段。
+
+        返回:
+            optimizer: 配置好的优化器实例。
+        """
+        # 从模型中获取所有参数及其名称
         param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
+        # 过滤出需要梯度的参数
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        # 根据参数维度分组，2D及以上参数使用权重衰减
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        # 构建优化器参数组
         optim_groups = [
             {'params': decay_params, 'weight_decay': weight_decay},
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
+        # 统计各组参数数量
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        # 打印参数统计信息
         print0(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print0(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
+        # 根据设备类型选择是否使用融合版AdamW优化器
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         print0(f"using fused AdamW: {use_fused}")
+        # 根据zero_stage选择优化器类型
         if zero_stage == 1:
             print0("using ZeroRedundancyOptimizer")
             optimizer = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
@@ -272,26 +361,35 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        根据给定的条件序列idx（形状为(b,t)的LongTensor），通过模型生成新的token序列。
+        该函数将依据模型当前的状态，依次生成max_new_tokens个新的token，并将其反馈回模型以继续生成。
+        在使用此功能时，通常需要确保模型处于eval()模式。
+        
+        参数:
+        - idx: 长整型张量，形状为(b,t)，表示条件序列。
+        - max_new_tokens: 整数，表示要生成的最大新token数量。
+        - temperature: 浮点数，表示生成过程的温度参数，默认为1.0。
+        - top_k: 整数或None，表示在生成时考虑的最高k个候选，默认为None。
+        
+        返回:
+        - idx: 长整型张量，形状为(b, t+max_new_tokens)，表示生成的完整序列。
         """
         for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
+            # 如果序列上下文长度超过模型的block_size，需要裁剪
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
+            # 将裁剪后的序列送入模型，获取序列下一位的logits
             logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
+            # 对logits进行温度调整
             logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
+            # 如果指定了top_k，对logits进行裁剪，只保留最可能的top_k个
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
+            # 应用softmax函数将logits转换为概率
             probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
+            # 从概率分布中采样下一个token
             idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
+            # 将采样的token添加到序列中，并继续下一轮生成
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
@@ -300,30 +398,73 @@ class GPT(nn.Module):
 # Our own simple Distributed Data Loader
 
 def _peek_data_shard(filename):
-    # only reads the header, returns header data
+    """
+    读取数据文件的头部信息。
+
+    该函数用于检查二进制数据文件的格式是否正确，主要通过读取文件的头部信息来实现。
+    它首先检查文件的魔数（一个特定的数字序列），以确认文件格式，然后读取其他头部信息，
+    如数据版本和声称的令牌数量。目前，该函数仅返回令牌数量。
+
+    参数:
+    - filename: 要检查的二进制数据文件的名称。
+
+    返回值:
+    - ntok: 文件头部声称的令牌数量。
+
+    注意:
+    - 如果魔数不匹配或版本号不是1，函数将打印错误信息并退出。
+    - 如果文件格式正确，该函数为数据处理或验证提供了一个快速的预检查机制。
+    """
+    # 以二进制模式打开文件，用于读取原始字节数据
     with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
+        # 首先读取头部，这里是256个int32整数（每个4字节）
         header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    
+    # 检查魔数是否正确，这是确认文件格式的关键
     if header[0] != 20240520:
+        # 如果魔数不匹配，打印错误提示信息并退出
         print("ERROR: magic number mismatch in the data .bin file!")
         print("---> HINT: Are you passing in a correct file with --input_bin?")
         print("---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README")
         print("---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try")
         exit(1)
+    
+    # 确认版本号为1，其他版本目前不支持
     assert header[1] == 1, "unsupported version"
-    ntok = header[2] # number of tokens (claimed)
-    return ntok # for now just return the number of tokens
+    
+    # ntok是文件头部声称的令牌数量
+    ntok = header[2] 
+    
+    # 目前仅返回令牌数量
+    return ntok 
 
 def _load_data_shard(filename):
+    """
+    从给定的二进制文件中加载数据片段。
+
+    此函数用于从包含数据和元数据的二进制文件中加载数据。它首先读取文件的头部，
+    检查魔法数字和版本号，然后读取实际的数据令牌。
+
+    参数:
+    - filename: 要加载数据的文件名。
+
+    返回:
+    - tokens: 从文件中读取的数据令牌数组。
+    """
+    # 打开文件以进行二进制读取
     with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
+        # 首先读取头部，其中包含256个int32整数（每个4字节）
         header = np.frombuffer(f.read(256*4), dtype=np.int32)
-        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-        assert header[1] == 1, "unsupported version"
-        ntok = header[2] # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
+        # 检查魔法数字是否匹配，以验证文件格式
+        assert header[0] == 20240520, "魔法数字在数据.bin文件中不匹配"
+        # 检查版本号，目前只支持版本1
+        assert header[1] == 1, "不支持的版本"
+        ntok = header[2]  # 数据令牌的数量（声明的数量）
+        # 剩余部分是令牌，存储为uint16
         tokens = np.frombuffer(f.read(), dtype=np.uint16)
-    assert len(tokens) == ntok, "number of tokens read does not match header?"
+    # 确保读取的令牌数量与头部声明的数量一致
+    assert len(tokens) == ntok, "读取的令牌数量与头部不匹配？"
+    # 返回读取的令牌数组
     return tokens
 
 class DistributedDataLoader:
@@ -428,21 +569,31 @@ def write_tensors(model_tensors, L, file, dtype):
 @torch.no_grad()
 def pad_vocab(tensor, multiple=128, value=0):
     """
-    The dimension of the vocab size in GPT-2 is 50,257
-    which is unfortunately a very unfriendly number for a lot of
-    matrix operations on the GPU. So we pad it to the nearest
-    friendlier multiple, e.g. 50,304 if multiple=128 when we
-    export the weights into C land. This is a NOOP algorithmically
-    and is only done to make the tensor operations more efficient.
+    为了提高GPU上的矩阵运算效率，对GPT-2的词汇表大小维度进行填充。
+    GPT-2的词汇表大小为50,257，这个数字对于很多GPU上的矩阵操作来说不够“友好”。
+    因此，我们将它填充到最接近的“友好”倍数，例如，当multiple=128时填充到50,304。
+    这在算法上是一个无操作（NOOP），只是为了使张量操作更加高效。
+    
+    参数:
+    tensor: 需要填充的二维张量，代表GPT-2的词汇表。
+    multiple: 填充到的最接近的倍数，默认为128。
+    value: 用于填充的数值，默认为0。
+    
+    返回:
+    padded: 填充后的张量，其行数是multiple的倍数。
     """
+    # 确保输入张量是二维的
     assert tensor.ndim == 2
     V, C = tensor.shape
+    # 确保输入张量的行数是GPT-2词汇表大小
     assert V == 50257, "just being defensive here"
-    # calculate padded vocab size by rounding up to nearest multiple
+    # 计算填充后的词汇表大小，通过向上取整到最近的multiple倍数
     Vp = ((V + multiple - 1) // multiple) * multiple
-    # pad the tensor
+    # 计算需要填充的行数
     pad_rows = Vp - V
+    # 根据需要填充的行数，对张量进行填充，如果pad_rows为0，则不进行填充
     padded = tensor if pad_rows == 0 else F.pad(tensor, (0, 0, 0, pad_rows), value=value)
+    # 确保填充后的张量形状正确
     assert padded.shape == (Vp, C)
     return padded
 

@@ -520,7 +520,7 @@ class DistributedDataLoader:
 
 # -----------------------------------------------------------------------------
 # Python -> C bridge utilities for saving params/grads/activations to .bin files
-
+##TODO nedd to be read and comprehansion
 def write_fp32(tensor, file):
     t = tensor.detach().cpu().to(torch.float32)
     b = t.numpy().tobytes()

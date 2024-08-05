@@ -469,25 +469,42 @@ def _load_data_shard(filename):
 
 class DistributedDataLoader:
     def __init__(self, filename_pattern, B, T, process_rank, num_processes):
+        """
+        初始化函数，用于在数据加载器中设置各种参数和加载数据文件。
+
+        参数:
+        - filename_pattern: str，文件名模式，用于匹配数据文件。
+        - B: int，批量大小。
+        - T: int，序列长度。
+        - process_rank: int，当前进程的排名。
+        - num_processes: int，总进程数。
+
+        该函数会根据提供的文件名模式搜索文件，验证数据分片，并计算总令牌数。
+        """
+        # 初始化类属性
         self.process_rank = process_rank
         self.num_processes = num_processes
         self.B = B
         self.T = T
 
-        # glob files that match the pattern
+        # 搜索符合模式的文件并排序
         self.files = sorted(glob.glob(filename_pattern))
-        assert len(self.files) > 0, f"did not find any files that match the pattern {filename_pattern}"
+        # 确保找到了匹配的文件
+        assert len(self.files) > 0, f"未找到任何匹配模式 {filename_pattern} 的文件"
 
-        # load and validate all data shards, count number of tokens in total
+        # 加载和验证所有数据分片，统计总令牌数
         ntok_total = 0
         for fname in self.files:
+            # 预览数据分片并获取令牌数
             shard_ntok = _peek_data_shard(fname)
+            # 确保每个分片的令牌数至少满足最小要求
             assert shard_ntok >= num_processes * B * T + 1
             ntok_total += shard_ntok
         self.ntok_total = ntok_total
-        print0(f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files")
+        # 打印总令牌数和文件数
+        print0(f"DataLoader: 总令牌数: {ntok_total:,}，跨越 {len(self.files)} 个文件")
 
-        # kick things off
+        # 准备开始处理数据
         self.current_shard = None
         self.reset()
 
@@ -497,9 +514,12 @@ class DistributedDataLoader:
         if self.current_shard != 0:
             self.current_shard = 0
             self.tokens = _load_data_shard(self.files[self.current_shard])
+        # 加载第一个分片的数据  
+        # 更新位置
         self.current_position = self.process_rank * self.B * self.T
 
     def advance(self): # advance to next data shard
+        ## 读取下一个分片数据
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = self.process_rank * self.B * self.T
         self.tokens = _load_data_shard(self.files[self.current_shard])
@@ -507,13 +527,18 @@ class DistributedDataLoader:
     def next_batch(self):
         B = self.B
         T = self.T
+        # 读取一个batch的数据
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        # 转tensor
         buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
+        # 生成训练数据，目标预测下一个词 ，形状为  (B, T)
         x = (buf[:-1]).view(B, T) # inputs
         y = (buf[1:]).view(B, T) # targets
+        # 移动读取数据的指针
         # advance the start pointer in current shard
         self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds advance the shard
+        # 如果加载下一个batch的数据超出范围，则加载下一个分片
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.advance()
         return x, y
@@ -521,11 +546,13 @@ class DistributedDataLoader:
 # -----------------------------------------------------------------------------
 # Python -> C bridge utilities for saving params/grads/activations to .bin files
 ##TODO nedd to be read and comprehansion
+## 保存权重以float32的形式
 def write_fp32(tensor, file):
     t = tensor.detach().cpu().to(torch.float32)
     b = t.numpy().tobytes()
     file.write(b)
 
+## 保存权重以bfloat16的形式
 def write_bf16(tensor, file):
     t = tensor.detach().cpu().to(torch.bfloat16)
     # numpy doesn't have bf16 datatype so we have to trick it
@@ -533,12 +560,16 @@ def write_bf16(tensor, file):
     b = t.numpy().tobytes()
     file.write(b)
 
+## 保存gpt2 的权重参数
 def write_tensors(model_tensors, L, file, dtype):
     # writes the GPT-2 model's weights to a binary file
     assert dtype in {"float32", "bfloat16"}
     write_fun = write_fp32 if dtype == "float32" else write_bf16
+    # 保存 词嵌入权重
     write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
+    #保存 位置编码权重
     write_fun(model_tensors["transformer.wpe.weight"], file) # (T, C)
+    ## 保存 transformer的block的权重 ln1 attn ln2 mlp
     for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
     for i in range(L): # (L, C)
@@ -563,6 +594,7 @@ def write_tensors(model_tensors, L, file, dtype):
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
     for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
+    ## last  ln func 权重
     write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
     write_fun(model_tensors["transformer.ln_f.bias"], file) # (C, )
 
@@ -598,34 +630,46 @@ def pad_vocab(tensor, multiple=128, value=0):
     return padded
 
 def write_model(model, filename, dtype):
-    # everything we need to instantiate the model
-    # 1) header is: version int, GPTConfig ints, padding to 1024 bytes
-    assert dtype in {"float32", "bfloat16"} # float16 todo maybe later
+    """
+    将模型参数写入二进制文件。
+
+    参数：
+    model: 模型实例。
+    filename: 保存模型的文件名。
+    dtype: 模型参数的数据类型，支持"float32"和"bfloat16"。
+
+    返回：
+    无。
+    """
+    # 确保数据类型是支持的
+    assert dtype in {"float32", "bfloat16"}  # float16 可能以后支持
+    # 根据数据类型设置版本号
     version = {
-        "float32": 3, # 3: all tensors are fp32, padded vocab
-        "bfloat16": 5, # 5: all tensors are bf16, padded vocab
+        "float32": 3,  # 3: 所有张量都是fp32，填充过的词汇表
+        "bfloat16": 5,  # 5: 所有张量都是bf16，填充过的词汇表
     }[dtype]
+    # 初始化头部信息，包含模型配置的元数据
     header = torch.zeros(256, dtype=torch.int32)
-    header[0] = 20240326 # magic
-    header[1] = version # checkpoint version
+    header[0] = 20240326  # 魔法数字
+    header[1] = version  # 检查点版本
     header[2] = model.config.block_size
     header[3] = model.config.vocab_size
     header[4] = model.config.n_layer
     header[5] = model.config.n_head
     header[6] = model.config.n_embd
-    # 2) the parameters follow the header
+    # 获取模型的所有参数
     params = {name: param.cpu() for name, param in model.named_parameters()}
-    # pad the vocab to a multiple of 128 here at export, for efficiency in C
-    wte = params["transformer.wte.weight"] # (V, C)
-    wte_padded = pad_vocab(wte) # (Vp, C)
-    params["transformer.wte.weight"] = wte_padded # (Vp, C)
-    print(f"padded vocab size from {wte.size(0)} to {wte_padded.size(0)}")
-    header[7] = wte_padded.size(0) # padded vocab size store in header
-    # now write to file
+    # 将词汇表填充到128的倍数，以提高C中的效率
+    wte = params["transformer.wte.weight"]  # (V, C)
+    wte_padded = pad_vocab(wte)  # (Vp, C)
+    params["transformer.wte.weight"] = wte_padded  # (Vp, C)
+    print(f"词汇表大小从 {wte.size(0)} 填充到 {wte_padded.size(0)}")
+    header[7] = wte_padded.size(0)  # 填充后的词汇表大小存储在头部
+    # 写入文件
     with open(filename, "wb") as file:
-        file.write(header.numpy().tobytes()) # header
-        write_tensors(params, model.config.n_layer, file, dtype) # params
-    print(f"wrote {filename}")
+        file.write(header.numpy().tobytes())  # 写入头部
+        write_tensors(params, model.config.n_layer, file, dtype)  # 写入参数
+    print(f"已写入 {filename}")
 
 def write_state(model, x, y, logits, loss, filename):
     # the state is used for debugging.
@@ -658,20 +702,44 @@ def write_state(model, x, y, logits, loss, filename):
     print(f"wrote {filename}")
 
 def write_tokenizer(enc, filename):
+    """
+    将编码器信息保存到文件中，用于分词。
+
+    参数:
+    enc: 编码器对象，包含分词所需的映射信息。
+    filename: 保存编码器信息的文件名。
+
+    返回:
+    无返回值，但会在指定路径创建一个用于分词的文件。
+    """
+    # 计算需要支持的最大token数量
     n = enc.max_token_value + 1
+    # 创建一个头部数组，用于存储编码器的元数据信息
     header = torch.zeros(256, dtype=torch.int32)
-    header[0] = 20240328 # magic
-    header[1] = 2 # tokenizer version = 2 (1 -> 2: includes EOT token)
-    header[2] = n # number of tokens
-    header[3] = enc.eot_token # EOT token
+    # 设置一个魔法数字，用于标识文件的类型
+    header[0] = 20240328
+    # 设置编码器版本为2，表示包括了EOT（End of Text）标记
+    header[1] = 2
+    # 存储token的数量
+    header[2] = n
+    # 存储EOT标记的token值
+    header[3] = enc.eot_token
+    # 打开指定文件，准备写入编码器信息
     with open(filename, "wb") as file:
+        # 写入头部信息
         file.write(header.numpy().tobytes())
+        # 遍历每个token，将其信息写入文件
         for i in range(n):
+            # 解码单个token为字节序列
             b = enc.decode_bytes([i])
+            # 检查字节序列长度，确保不超过255字节
             length = len(b)
             assert length < 256, f"Token length exceeds 255: {length}"
-            file.write(struct.pack("<B", length))  # Write the length as a 1-byte unsigned integer
-            file.write(b)  # Write the actual bytes
+            # 写入字节序列的长度
+            file.write(struct.pack("<B", length))
+            # 写入实际的字节序列
+            file.write(b)
+    # 输出文件写入完成的信息
     print(f"wrote {filename}")
 
 # -----------------------------------------------------------------------------
@@ -735,18 +803,38 @@ if __name__ == "__main__":
     assert args.model in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl", "d12", "d24", "d36", "d48"}
 
     # set up DDP (distributed data parallel). torchrun sets this env variable
+    # 分布式多机多卡训练
     ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
     if ddp:
         # use of DDP atm demands CUDA, we set the device appropriately according to rank
+        # 确保CUDA可用，目前我们认为DDP（分布式数据并行）需要CUDA支持
         assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-        init_process_group(backend='nccl')
-        ddp_rank = int(os.environ['RANK'])
+
+        # 初始化进程组，使用NCCL作为后端
+        init_process_group(backend='nccl') 
+
+        # 获取当前进程的全局排名
+        ddp_rank = int(os.environ['RANK']) 
+
+        # 获取当前进程的本地排名
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
+
+        # 获取整个分布式系统中的进程总数
         ddp_world_size = int(os.environ['WORLD_SIZE'])
+
+        # 根据本地排名选择对应的CUDA设备
         device = f'cuda:{ddp_local_rank}'
+
+        # 设置当前进程使用的CUDA设备
         torch.cuda.set_device(device)
-        master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-        seed_offset = 0 # each process gets the exact same seed
+
+        # 判断当前进程是否为主进程，主进程将负责日志记录和模型保存等工作
+        master_process = ddp_rank == 0 
+
+        # 所有进程使用完全相同的随机种子
+        seed_offset = 0 
+
+        # 根据命令行参数设置ZeRO阶段
         zero_stage = args.zero_stage
     else:
         ddp_rank = 0
@@ -770,14 +858,17 @@ if __name__ == "__main__":
     device_type = 'cuda' if 'cuda' in device else 'cpu'
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
+    ## 总进程的读取tokens数量
     tokens_per_fwdbwd = B * T * ddp_world_size
     assert args.total_batch_size % tokens_per_fwdbwd == 0
+    # 梯度累积次数，数值够了执行反向传播
     grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
     print0(f"total desired batch size: {args.total_batch_size}")
     print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
     # set up a context manager following the desired dtype and device
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[args.dtype]
+    #精度设置训练
     ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
 
     # rng / reproducibility
@@ -788,13 +879,14 @@ if __name__ == "__main__":
     # set the torch precision mode to use TensorFloat32 (TF32) for matmuls
     # docs https://pytorch.org/docs/stable/generated/torch.set_float32_matmul_precision.html
     if args.tensorcores:
-        torch.set_float32_matmul_precision('high')
+        torch.set_float32_matmul_precision('high')## tensorcore 高精度计算
 
-    # turn on/off flash attention
+    # turn on/off flash attention 是否开启flash attention
     assert args.flash in {0, 1}
     FLASH = args.flash
 
     # init (and write) the tokenizer
+    # 拿到 tokenizer 编码器
     enc = tiktoken.get_encoding("gpt2")
     if master_process and args.write_tensors: # tokenizer is technically not tensors but ok
         write_tokenizer(enc, "gpt2_tokenizer.bin")
@@ -802,6 +894,7 @@ if __name__ == "__main__":
     # init the model, either from scratch or from OpenAI pretrained checkpoint
     if args.model[0] == "d":
         # from scratch (random weights)
+        # 基本配置，得到随机初始化的权重
         model_config = {
             "d12": GPTConfig(block_size=1024, vocab_size=50257, n_layer=12, n_head=12, n_embd=768),
             "d24": GPTConfig(block_size=1024, vocab_size=50257, n_layer=24, n_head=16, n_embd=1024),
@@ -810,20 +903,20 @@ if __name__ == "__main__":
         }[args.model]
         model = GPT(model_config)
     else:
-        # load the GPT-2 model weights
+        # load the GPT-2 model weights，加载预训练权重
         model = GPT.from_pretrained(args.model)
-    model.train()
-    model.to(device)
+    model.train()### 设置训练模式
+    model.to(device) ## 将模型参数移动到GPU
     if args.compile:
         if hasattr(config, "coordinate_descent_tuning"):
             config.coordinate_descent_tuning = True # suggested by @Chillee
         print0("compiling the model...")
-        model = torch.compile(model)
+        model = torch.compile(model)## 图优化
 
     # -------------------------------------------------------------------------
     # Our own version of a simple DistributedDataLoader
 
-    # load tokens
+    # load tokens 加载tokens
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
     val_loader = None
     if args.input_val_bin:
@@ -833,11 +926,12 @@ if __name__ == "__main__":
     # PyTorch -> C bridge: save some weights and state for C to load later as reference
 
     # do one forward pass to generate ground truth for our C tests
+    # 做一次测试 生成C测试数据
     if master_process and args.write_tensors and (not args.inference_only):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        logits, loss = model(x, y)
-        loss.backward()
+        x, y = train_loader.next_batch()## 获取batch数据
+        x, y = x.to(device), y.to(device)## move to gpu
+        logits, loss = model(x, y) # model forward pass
+        loss.backward() #       # backward pass
         # save model params, in both float32 and bfloat16
         model_to_size = {"gpt2": "124M", "gpt2-medium": "355M", "gpt2-large": "774M", "gpt2-xl": "1558M"}
         model_to_size.update({f"d{d}": f"d{d}" for d in [12, 24, 36, 48]})
@@ -856,6 +950,7 @@ if __name__ == "__main__":
     # here we wrap model into DDP container
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
+    ## warp ddp 会让模型的字典多了 module 的 字符串
     raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
     # init the optimizer
@@ -863,7 +958,7 @@ if __name__ == "__main__":
                                                learning_rate=args.learning_rate, betas=(0.9, 0.95),
                                                device_type=device, zero_stage=zero_stage)
 
-    # learning rate decay scheduler (cosine with warmup)
+    # learning rate decay scheduler (cosine with warmup) 带预热的余弦退火学习率
     def get_lr(it):
         min_lr = args.learning_rate * args.learning_rate_decay_frac
         # 1) linear warmup for warmup_iters steps
@@ -879,6 +974,7 @@ if __name__ == "__main__":
         return min_lr + coeff * (args.learning_rate - min_lr)
 
     # create the logging directory if it does not exist
+    ## 打log
     logfile = None
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -896,6 +992,7 @@ if __name__ == "__main__":
         last_step = (step == args.num_iterations)
 
         # once in a while evaluate the validation dataset
+        ### 做一次val
         if (args.val_loss_every > 0 \
             and (step % args.val_loss_every == 0 or last_step)) \
             and (val_loader is not None):
@@ -916,6 +1013,7 @@ if __name__ == "__main__":
                     f.write("s:%d tel:%f\n" % (step, val_loss))
 
         # once in a while perform model inference on the master process
+        # 推理一次
         if (args.sample_every > 0 \
             and (step % args.sample_every == 0 or last_step)) \
             and master_process:
@@ -963,7 +1061,7 @@ if __name__ == "__main__":
                 # because the gradients just add on each successive backward().
                 # addition of gradients corresponds to a SUM in the objective, but
                 # instead of a SUM we want MEAN, so we scale the loss here
-                loss = loss / grad_accum_steps
+                loss = loss / grad_accum_steps### 梯度累加除以它
                 lossf += loss.detach() # keep track of the mean loss
             # backward pass
             if not args.inference_only:
@@ -980,7 +1078,7 @@ if __name__ == "__main__":
         optimizer.step()
         # --------------- TRAINING SECTION END -------------------
         # everything that follows now is just diagnostics, prints, logging, etc.
-
+        ###训练状态的 输出
         # wait on the CPU for all device work to end so we get accurate per-iteration timings below
         if device == "mps":
             torch.mps.synchronize()

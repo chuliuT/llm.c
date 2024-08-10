@@ -39,16 +39,16 @@ void encoder_forward(float* out,
     // inp is (B,T) of integers, holding the token ids at each (b,t) position
     // wte is (V,C) of token embeddings, short for "weight token embeddings"
     // wpe is (maxT,C) of position embeddings, short for "weight positional embedding"
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
+    for (int b = 0; b < B; b++) { //batch 维度上迭代
+        for (int t = 0; t < T; t++) {//序列长度 上迭代
             // seek to the output position in out[b,t,:]
-            float* out_bt = out + b * T * C + t * C;
+            float* out_bt = out + b * T * C + t * C;//拿到输出位置的指针
             // get the index of the token at inp[b, t]
-            int ix = inp[b * T + t];
+            int ix = inp[b * T + t];// 输入位置的指针 [B,T] b*T + t 一个数据在序列长度上的索引
             // seek to the position in wte corresponding to the token
-            float* wte_ix = wte + ix * C;
+            float* wte_ix = wte + ix * C;// 拿到token的指针 vocab_size * C ix代表了数据在词表中的索引 vocab_size中的idx
             // seek to the position in wpe corresponding to the position
-            float* wpe_t = wpe + t * C;
+            float* wpe_t = wpe + t * C;// 拿到位置编码的指针 T * C  t*C得到索引的idx
             // add the two vectors and store the result in out[b,t,:]
             for (int i = 0; i < C; i++) {
                 out_bt[i] = wte_ix[i] + wpe_t[i];
@@ -62,13 +62,14 @@ void encoder_backward(float* dwte, float* dwpe,
                       int B, int T, int C) {
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            float* dout_bt = dout + b * T * C + t * C;
-            int ix = inp[b * T + t];
-            float* dwte_ix = dwte + ix * C;
-            float* dwpe_t = dwpe + t * C;
-            for (int i = 0; i < C; i++) {
-                float d = dout_bt[i];
-                dwte_ix[i] += d;
+            float* dout_bt = dout + b * T * C + t * C;// btc 输出结果的 梯度索引指针 (起始地址)
+            int ix = inp[b * T + t];//从输入位置的索引
+            float* dwte_ix = dwte + ix * C;// 拿到token的指针
+            float* dwpe_t = dwpe + t * C;// 拿到位置编码的指针
+            for (int i = 0; i < C; i++) {// C 维度上迭代
+                float d = dout_bt[i];//获取梯度的真实值
+                // out = wte+wpe  在求导的时候 对应的 位置上 梯度相加
+                dwte_ix[i] += d;//梯度累加
                 dwpe_t[i] += d;
             }
         }
@@ -83,77 +84,103 @@ void layernorm_forward(float* out, float* mean, float* rstd,
     // mean and rstd are (B,T) buffers, to be used later in backward pass
     // at each position (b,t) of the input, the C-dimensional vector
     // of activations gets normalized, then scaled and shifted
-    float eps = 1e-5f;
+    float eps = 1e-5f;// 数值稳定 防止数值不稳定
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             // seek to the input position inp[b,t,:]
-            float* x = inp + b * T * C + t * C;
+            float* x = inp + b * T * C + t * C; // 获取x的指针头
             // calculate the mean
-            float m = 0.0f;
+            float m = 0.0f; // 计算均值
             for (int i = 0; i < C; i++) {
                 m += x[i];
             }
             m = m/C;
             // calculate the variance (without any bias correction)
-            float v = 0.0f;
+            float v = 0.0f;// 计算方差
             for (int i = 0; i < C; i++) {
                 float xshift = x[i] - m;
                 v += xshift * xshift;
             }
             v = v/C;
+            // 计算逆标准差
             // calculate the rstd (reciprocal standard deviation)
             float s = 1.0f / sqrtf(v + eps);
             // seek to the output position in out[b,t,:]
-            float* out_bt = out + b * T * C + t * C;
+            float* out_bt = out + b * T * C + t * C;//输出的指针头
             for (int i = 0; i < C; i++) {
-                float n = (s * (x[i] - m)); // normalize
-                float o = n * weight[i] + bias[i]; // scale and shift
+                float n = (s * (x[i] - m)); // normalize 归一化
+                float o = n * weight[i] + bias[i]; // scale and shift 乘上缩放  +偏移
                 out_bt[i] = o; // write
             }
             // cache the mean and rstd for the backward pass later
-            mean[b * T + t] = m;
+            mean[b * T + t] = m;// 保存下 均值和逆标准差
             rstd[b * T + t] = s;
         }
     }
 }
 
+// 实现Layer Normalization层的反向传播
+// dinp: 输入梯度数组
+// dweight: 权重梯度数组
+// dbias: 偏置梯度数组
+// dout: 输出梯度数组
+// inp: 输入数组
+// weight: 权重数组
+// mean: 均值数组
+// rstd: 逆标准差数组
+// B: 批量大小
+// T: 序列长度
+// C: 特征数
 void layernorm_backward(float* dinp, float* dweight, float* dbias,
                         float* dout, float* inp, float* weight, float* mean, float* rstd,
                         int B, int T, int C) {
+    // 遍历批量中的每个样本
     for (int b = 0; b < B; b++) {
+        // 遍历每个样本的每个时间步
         for (int t = 0; t < T; t++) {
+            // 获取梯度的指针 和均值和逆标准差
             float* dout_bt = dout + b * T * C + t * C;
             float* inp_bt = inp + b * T * C + t * C;
             float* dinp_bt = dinp + b * T * C + t * C;
             float mean_bt = mean[b * T + t];
             float rstd_bt = rstd[b * T + t];
 
-            // first: two reduce operations
+            // 首先进行两个归约操作
+            //https://www.cvmart.net/community/detail/6461
+            // 求 x  w b 的梯度
+            // w 的好求  等于 norm_bti * dout_bt[i];  上面 norm x * weight +bias 求导 得到 Loss/y y/w (norm x)  = Loss/y *norm x
+            // b 的好求  等于 norm_bti * dout_bt[i];  上面 norm x * weight +bias 求导 得到 Loss/y y/b  = Loss/y * 1
+            // x的 导数分3项 
+            // 第一项   weight[i] * dout_bt[i];
+            //第二项  dnorm_mean
+            // 第三项  norm_bti * dnorm_norm_mean
+            // 乘上最终的 rstd
             float dnorm_mean = 0.0f;
             float dnorm_norm_mean = 0.0f;
+            // 遍历每个特征，计算归一化值和梯度
             for (int i = 0; i < C; i++) {
-                float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
-                float dnorm_i = weight[i] * dout_bt[i];
-                dnorm_mean += dnorm_i;
+                float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt; // 计算归一化值
+                float dnorm_i = weight[i] * dout_bt[i]; // 
+                dnorm_mean += dnorm_i; // 累加归一化值的均值梯度
                 dnorm_norm_mean += dnorm_i * norm_bti;
             }
-            dnorm_mean = dnorm_mean / C;
+            dnorm_mean = dnorm_mean / C; 
             dnorm_norm_mean = dnorm_norm_mean / C;
 
-            // now iterate again and accumulate all the gradients
+            // 再次遍历每个特征，累积所有梯度
             for (int i = 0; i < C; i++) {
                 float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
                 float dnorm_i = weight[i] * dout_bt[i];
-                // gradient contribution to bias
+                // 对偏置的梯度贡献
                 dbias[i] += dout_bt[i];
-                // gradient contribution to weight
+                // 对权重的梯度贡献
                 dweight[i] += norm_bti * dout_bt[i];
-                // gradient contribution to input
+                // 对输入的梯度贡献
                 float dval = 0.0f;
-                dval += dnorm_i; // term 1
-                dval -= dnorm_mean; // term 2
-                dval -= norm_bti * dnorm_norm_mean; // term 3
-                dval *= rstd_bt; // final scale
+                dval += dnorm_i; // 第一项
+                dval -= dnorm_mean; // 第二项
+                dval -= norm_bti * dnorm_norm_mean; // 第三项
+                dval *= rstd_bt; // 最终缩放
                 dinp_bt[i] += dval;
             }
         }
@@ -166,14 +193,16 @@ void matmul_forward_naive(float* out,
     // the most naive implementation of matrix multiplication
     // this serves as an algorithmic reference, and as a fallback for
     // unfriendly input shapes inside matmul_forward(), below.
+    // inp is (B,T,C), weight is (OC, C), bias is (OC)
+    // out will be (B,T,OC)
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             int bt = b * T + t;
             for (int o = 0; o < OC; o++) {
-                float val = (bias != NULL) ? bias[o] : 0.0f;
+                float val = (bias != NULL) ? bias[o] : 0.0f; // 带bias
                 for (int i = 0; i < C; i++) {
-                    val += inp[bt * C + i] * weight[o*C + i];
+                    val += inp[bt * C + i] * weight[o*C + i]; // 在C维度上做逐个元素矩阵相乘
                 }
                 out[bt * OC + o] = val;
             }
@@ -200,6 +229,7 @@ void matmul_forward(float* out,
 
     // collapse the B and T loops into one and turn it into a strided loop.
     // then we can tile the inner loop, and reuse the loaded weight LOOP_UNROLL many times
+    // 这里 做了 tiling的优化
     #pragma omp parallel for
     for (int obt = 0; obt < B * T; obt += LOOP_UNROLL) {
         for (int o = 0; o < OC; o++) {
@@ -236,13 +266,15 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
     // but that doesn't afford an efficient parallelization strategy
 
     // backward into inp first, parallelize over B,T
+    // 注意下坐标  y=w*x的求导 d w     d in
+    // (B,T,OC) 
     #pragma omp parallel for collapse(2)
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
-            const float* dout_bt = dout + b * T * OC + t * OC;
-            float* dinp_bt = dinp + b * T * C + t * C;
+            const float* dout_bt = dout + b * T * OC + t * OC; // 输出梯度坐标的指针
+            float* dinp_bt = dinp + b * T * C + t * C; // 输入梯度坐标的指针
             for (int o = 0; o < OC; o++) {
-                const float* wrow = weight + o*C;
+                const float* wrow = weight + o*C;// weight 指针偏移
                 float d = dout_bt[o];
                 for (int i = 0; i < C; i++) {
                     dinp_bt[i] += wrow[i] * d;
@@ -257,7 +289,7 @@ void matmul_backward(float* dinp, float* dweight, float* dbias,
             for (int t = 0; t < T; t++) {
                 const float* dout_bt = dout + b * T * OC + t * OC;
                 const float* inp_bt = inp + b * T * C + t * C;
-                float* dwrow = dweight + o*C;
+                float* dwrow = dweight + o*C;// dweight 指针偏移
                 float d = dout_bt[o];
                 if (dbias != NULL) { dbias[o] += d; }
                 for (int i = 0; i < C; i++) {
@@ -286,16 +318,16 @@ void attention_forward(float* out, float* preatt, float* att,
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
-                float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+                float* query_t = inp + b * T * C3 + t * C3 + h * hs;// 计算query_t的指针
+                float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;// 计算preatt_bth的指针
+                float* att_bth = att + b*NH*T*T + h*T*T + t*T; //att_bth的指针
 
                 // pass 1: calculate query dot key and maxval
                 float maxval = -10000.0f; // TODO something better
                 for (int t2 = 0; t2 <= t; t2++) {
                     float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
 
-                    // (query_t) dot (key_t2)
+                    // (query_t) dot (key_t2) 计算dot
                     float val = 0.0f;
                     for (int i = 0; i < hs; i++) {
                         val += query_t[i] * key_t2[i];
@@ -310,15 +342,16 @@ void attention_forward(float* out, float* preatt, float* att,
 
                 // pass 2: calculate the exp and keep track of sum
                 // maxval is being calculated and subtracted only for numerical stability
+                // 开始计算softmax 
                 float expsum = 0.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float expv = expf(preatt_bth[t2] - maxval);
+                    float expv = expf(preatt_bth[t2] - maxval);// 数值稳定 
                     expsum += expv;
                     att_bth[t2] = expv;
                 }
                 float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
-                // pass 3: normalize to get the softmax
+                // pass 3: normalize to get the softmax   softmax的值
                 for (int t2 = 0; t2 < T; t2++) {
                     if (t2 <= t) {
                         att_bth[t2] *= expsum_inv;
@@ -331,12 +364,12 @@ void attention_forward(float* out, float* preatt, float* att,
 
                 // pass 4: accumulate weighted values into the output of attention
                 float* out_bth = out + b * T * C + t * C + h * hs;
-                for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
+                for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }// 初始化out_bth的值0
                 for (int t2 = 0; t2 <= t; t2++) {
                     float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
                     float att_btht2 = att_bth[t2];
                     for (int i = 0; i < hs; i++) {
-                        out_bth[i] += att_btht2 * value_t2[i];
+                        out_bth[i] += att_btht2 * value_t2[i];/// attn mask *value 
                     }
                 }
             }
@@ -344,57 +377,58 @@ void attention_forward(float* out, float* preatt, float* att,
     }
 }
 
+// 实现注意力机制的反向传播计算
 void attention_backward(float* dinp, float* dpreatt, float* datt,
                         float* dout, float* inp, float* att,
                         int B, int T, int C, int NH) {
-    // inp/dinp are (B, T, 3C) Q,K,V
-    // att/datt/dpreatt are (B, NH, T, T)
-    // dout is (B, T, C)
-    int C3 = C*3;
-    int hs = C / NH; // head size
-    float scale = 1.f / sqrtf(hs);
+    // inp/dinp 是 (B, T, 3C) 形状的输入，包含 Query, Key, Value
+    // att/datt/dpreatt 是 (B, NH, T, T) 形状的注意力矩阵及其梯度
+    // dout 是 (B, T, C) 形状的输出梯度
+    // B: batch 大小, T: 序列长度, C: 每个序列元素的维度, NH: 头数目
+    int C3 = C*3; // 输入维度的三倍，因为包含 Query, Key, Value
+    int hs = C / NH; // 每个头的维度大小
+    float scale = 1.f / sqrtf(hs); // 缩放因子，用于缩放注意力分数
 
+    // 遍历 batch 中的每个样本
     for (int b = 0; b < B; b++) {
+        // 遍历序列中的每个位置
         for (int t = 0; t < T; t++) {
+            // 遍历每个注意力头
             for (int h = 0; h < NH; h++) {
+                // 计算相关注意力矩阵和梯度的指针
                 float* att_bth = att + b*NH*T*T + h*T*T + t*T;
                 float* datt_bth = datt + b*NH*T*T + h*T*T + t*T;
                 float* dpreatt_bth = dpreatt + b*NH*T*T + h*T*T + t*T;
                 float* dquery_t = dinp + b * T * C3 + t * C3 + h * hs;
                 float* query_t = inp + b * T * C3 + t * C3 + h * hs;
 
-                // backward pass 4, through the value accumulation
+                // 反向传播计算，通过值的累加
                 float* dout_bth = dout + b * T * C + t * C + h * hs;
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
-                    float* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2;
+                    float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // Value部分
+                    float* dvalue_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C*2; // Value梯度部分
                     for (int i = 0; i < hs; i++) {
-                        // in the forward pass this was:
-                        // out_bth[i] += att_bth[t2] * value_t2[i];
-                        // so now we have:
+                        // 前向传播计算时的累加操作，现在计算对应的梯度
                         datt_bth[t2] += value_t2[i] * dout_bth[i];
                         dvalue_t2[i] += att_bth[t2] * dout_bth[i];
                     }
                 }
 
-                // backward pass 2 & 3, the softmax
-                // note that softmax (like e.g. tanh) doesn't need the input (preatt) to backward
+                // 反向传播计算，处理softmax操作
                 for (int t2 = 0; t2 <= t; t2++) {
                     for (int t3 = 0; t3 <= t; t3++) {
-                        float indicator = t2 == t3 ? 1.0f : 0.0f;
-                        float local_derivative = att_bth[t2] * (indicator - att_bth[t3]);
-                        dpreatt_bth[t3] += local_derivative * datt_bth[t2];
+                        float indicator = t2 == t3 ? 1.0f : 0.0f; // 对角元素为1，其余为0
+                        float local_derivative = att_bth[t2] * (indicator - att_bth[t3]); // 计算局部导数
+                        dpreatt_bth[t3] += local_derivative * datt_bth[t2]; // 更新preatt的梯度
                     }
                 }
 
-                // backward pass 1, the query @ key matmul
+                // 反向传播计算，处理Query和Key的矩阵乘法
                 for (int t2 = 0; t2 <= t; t2++) {
-                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
-                    float* dkey_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                    float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // Key部分
+                    float* dkey_t2 = dinp + b * T * C3 + t2 * C3 + h * hs + C; // Key梯度部分
                     for (int i = 0; i < hs; i++) {
-                        // in the forward pass this was:
-                        // preatt_bth[t2] += (query_t[i] * key_t2[i]) * scale;
-                        // so now we have:
+                        // 前向传播的矩阵乘法操作，现在计算对应的梯度
                         dquery_t[i] += key_t2[i] * dpreatt_bth[t2] * scale;
                         dkey_t2[i] += query_t[i] * dpreatt_bth[t2] * scale;
                     }
@@ -405,11 +439,18 @@ void attention_backward(float* dinp, float* dpreatt, float* datt,
 }
 
 #define GELU_SCALING_FACTOR sqrtf(2.0f / M_PI)
+// GeLU前向传播函数，用于在Transformer模型的MLP块中应用GeLU非线性激活函数
+// @param out 输出数组，存储计算后的结果
+// @param inp 输入数组，包含待处理的数据
+// @param N 数组元素的数量，用于确定循环的次数
 void gelu_forward(float* out, float* inp, int N) {
-    // (approximate) GeLU elementwise non-linearity in the MLP block of Transformer
+    // 遍历输入数组中的每个元素，应用GeLU激活函数
     for (int i = 0; i < N; i++) {
+        // 获取当前元素的值
         float x = inp[i];
+        // 计算x的立方，用于GeLU函数的近似计算
         float cube = 0.044715f * x * x * x;
+        // 计算GeLU函数的值，并存储到输出数组中
         out[i] = 0.5f * x * (1.0f + tanhf(GELU_SCALING_FACTOR * (x + cube)));
     }
 }
@@ -483,37 +524,54 @@ void softmax_forward(float* probs, float* logits, int B, int T, int V, int Vp) {
     }
 }
 
+// 计算交叉熵损失
+// 该函数计算给定概率和目标索引的交叉熵损失
+//
+// 参数:
+//   losses: 输出，(B,T)大小的数组，存储每个位置的个体损失
+//   probs: 输入，(B,T,Vp)大小的数组，存储概率
+//   targets: 输入，(B,T)大小的数组，存储logits中的正确索引
+//   B: 批量大小
+//   T: 序列长度
+//   Vp: 概率分布的维度
 void crossentropy_forward(float* losses,
                           float* probs, int* targets,
                           int B, int T, int Vp) {
-    // output: losses is (B,T) of the individual losses at each position
-    // input: probs are (B,T,Vp) of the probabilities
-    // input: targets is (B,T) of integers giving the correct index in logits
+    // 遍历批处理中的每个样本
     for (int b = 0; b < B; b++) {
+        // 遍历样本中的每个位置
         for (int t = 0; t < T; t++) {
-            // loss = -log(probs[target])
+            // 计算损失：-log(probs[target])
+            // 获取当前样本、当前位置的概率分布
             float* probs_bt = probs + b * T * Vp + t * Vp;
+            // 获取当前样本、当前位置的目标索引
             int ix = targets[b * T + t];
+            // 计算并存储交叉熵损失
             losses[b * T + t] = -logf(probs_bt[ix]);
         }
     }
 }
 
+// 计算softmax和交叉熵损失函数的反向传播梯度
 void crossentropy_softmax_backward(float* dlogits,
                            float* dlosses, float* probs, int* targets,
                            int B, int T, int V, int Vp) {
-    // backwards through both softmax and crossentropy
+    // 遍历每个样本和时间步
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
+            // 计算当前样本和时间步的dlogits和probs的起始地址
             float* dlogits_bt = dlogits + b * T * Vp + t * Vp;
             float* probs_bt = probs + b * T * Vp + t * Vp;
+            // 获取当前样本和时间步的损失函数梯度和目标索引
             float dloss = dlosses[b * T + t];
             int ix = targets[b * T + t];
-            // note we only loop to V, leaving the padded dimensions
-            // of dlogits untouched, so gradient there stays at zero
+            // 遍历每个类别，计算dlogits的梯度
             for (int i = 0; i < V; i++) {
+                // 获取当前类别的概率
                 float p = probs_bt[i];
+                // 计算one-hot编码的指示符
                 float indicator = i == ix ? 1.0f : 0.0f;
+                // 更新dlogits的梯度
                 dlogits_bt[i] += (p - indicator) * dloss;
             }
         }
@@ -532,7 +590,7 @@ typedef struct {
     int channels; // number of channels, e.g. 768
 } GPT2Config;
 
-// the parameters of the model
+// the parameters of the model 参数
 #define NUM_PARAMETER_TENSORS 16
 typedef struct {
     float* wte; // (V, C)
@@ -553,6 +611,7 @@ typedef struct {
     float* lnfb; // (C)
 } ParameterTensors;
 
+// 给参数 大小数值
 void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     size_t Vp = config.padded_vocab_size;
     size_t C = config.channels;
@@ -576,6 +635,7 @@ void fill_in_parameter_sizes(size_t* param_sizes, GPT2Config config) {
     param_sizes[15] = C; // lnfb
 }
 
+// 开辟内存连续
 // allocate memory for the parameters and point the individual tensors to the right places
 float* malloc_and_point_parameters(ParameterTensors* params, size_t* param_sizes) {
     size_t num_parameters = 0;

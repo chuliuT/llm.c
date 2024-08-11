@@ -377,7 +377,7 @@ void attention_forward(float* out, float* preatt, float* att,
     }
 }
 
-// 实现注意力机制的反向传播计算
+// 实现注意力机制的反向传播计算 https://www.yuque.com/patrickstar-yyahs/bmthbo/svcr7ok05lw1e74m?singleDoc#
 void attention_backward(float* dinp, float* dpreatt, float* datt,
                         float* dout, float* inp, float* att,
                         int B, int T, int C, int NH) {
@@ -832,6 +832,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     }
 
     // convenience parameters (size_t to help prevent int overflow)
+    // 配置参数表 词表 padd 词表  层数 头数 通道数
     size_t V = model->config.vocab_size;
     size_t Vp = model->config.padded_vocab_size;
     size_t L = model->config.num_layers;
@@ -882,12 +883,36 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     ParameterTensors params = model->params; // for brevity
     ActivationTensors acts = model->acts;
     float* residual;
+    // 模型的forward   wte+wpe
     encoder_forward(acts.encoded, inputs, params.wte, params.wpe, B, T, C); // encoding goes into residual[0]
+    // 模型的层数 ，这里也就是  python代码那边的 block的forward
     for (int l = 0; l < L; l++) {
 
         residual = l == 0 ? acts.encoded : acts.residual3 + (l-1) * B * T * C;
 
-        // get the pointers of the weights for this layer
+        // get the pointers of the weights for this layer   权重和bias的指针
+        //// the parameters of the model 参数
+        // #define NUM_PARAMETER_TENSORS 16
+        // typedef struct {
+        //     float* wte; // (V, C)
+        //     float* wpe; // (maxT, C)
+        //     float* ln1w; // (L, C)
+        //     float* ln1b; // (L, C)
+        //     float* qkvw; // (L, 3*C, C)
+        //     float* qkvb; // (L, 3*C)
+        //     float* attprojw; // (L, C, C)
+        //     float* attprojb; // (L, C)
+        //     float* ln2w; // (L, C)
+        //     float* ln2b; // (L, C)
+        //     float* fcw; // (L, 4*C, C)
+        //     float* fcb; // (L, 4*C)
+        //     float* fcprojw; // (L, C, 4*C)
+        //     float* fcprojb; // (L, C)
+        //     float* lnfw; // (C)
+        //     float* lnfb; // (C)
+        // } ParameterTensors;
+        
+        // l 代表了每次的所属于的层数
         float* l_ln1w = params.ln1w + l * C;
         float* l_ln1b = params.ln1b + l * C;
         float* l_qkvw = params.qkvw + l * 3*C * C;
@@ -902,6 +927,33 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         float* l_fcprojb = params.fcprojb + l * C;
 
         // get the pointers of the activations for this layer
+        //         #define NUM_ACTIVATION_TENSORS 23
+        // typedef struct {
+        //     float* encoded; // (B, T, C)
+        //     float* ln1; // (L, B, T, C)
+        //     float* ln1_mean; // (L, B, T)
+        //     float* ln1_rstd; // (L, B, T)
+        //     float* qkv; // (L, B, T, 3*C)
+        //     float* atty; // (L, B, T, C)
+        //     float* preatt; // (L, B, NH, T, T)
+        //     float* att; // (L, B, NH, T, T)
+        //     float* attproj; // (L, B, T, C)
+        //     float* residual2; // (L, B, T, C)
+        //     float* ln2; // (L, B, T, C)
+        //     float* ln2_mean; // (L, B, T)
+        //     float* ln2_rstd; // (L, B, T)
+        //     float* fch; // (L, B, T, 4*C)
+        //     float* fch_gelu; // (L, B, T, 4*C)
+        //     float* fcproj; // (L, B, T, C)
+        //     float* residual3; // (L, B, T, C)
+        //     float* lnf; // (B, T, C)
+        //     float* lnf_mean; // (B, T)
+        //     float* lnf_rstd; // (B, T)
+        //     float* logits; // (B, T, V)
+        //     float* probs; // (B, T, V)
+        //     float* losses; // (B, T)
+        // } ActivationTensors;
+
         float* l_ln1 = acts.ln1 + l * B * T * C;
         float* l_ln1_mean = acts.ln1_mean + l * B * T;
         float* l_ln1_rstd = acts.ln1_rstd + l * B * T;
@@ -919,7 +971,8 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         float* l_fcproj = acts.fcproj + l * B * T * C;
         float* l_residual3 = acts.residual3 + l * B * T * C;
 
-        // now do the forward pass
+        // now do the forward pass 正向推理
+        // ln-> matmul-> attn -> matmul -> residual -> ln -> matmul -> gelu -> matmul -> residual -> ln ->matmul -> softmax
         layernorm_forward(l_ln1, l_ln1_mean, l_ln1_rstd, residual, l_ln1w, l_ln1b, B, T, C);
         matmul_forward(l_qkv, l_ln1, l_qkvw, l_qkvb, B, T, C, 3*C);
         attention_forward(l_atty, l_preatt, l_att, l_qkv, B, T, C, NH);
@@ -937,7 +990,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
     softmax_forward(acts.probs, acts.logits, B, T, V, Vp);
 
     // also forward the cross-entropy loss function if we have the targets
-    if (targets != NULL) {
+    if (targets != NULL) {// 如果  target 不为空
         crossentropy_forward(model->acts.losses, model->acts.probs, targets, B, T, Vp);
         // for convenience also evaluate the mean loss
         float mean_loss = 0.0f;
@@ -951,6 +1004,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
 }
 
 void gpt2_zero_grad(GPT2 *model) {
+    // 将梯度的内存置0
     if(model->grads_memory != NULL) { memset(model->grads_memory, 0, model->num_parameters * sizeof(float)); }
     if(model->grads_acts_memory != NULL) { memset(model->grads_acts_memory, 0, model->num_activations * sizeof(float)); }
 }
@@ -990,8 +1044,9 @@ void gpt2_backward(GPT2 *model) {
     // total, final loss as the mean over all losses over all (B,T) positions in the batch
     float dloss_mean = 1.0f / (B*T);
     for (int i = 0; i < B*T; i++) { grads_acts.losses[i] = dloss_mean; }
-
+    // 正向传播的   倒序执行 这里执行的是 backward函数
     crossentropy_softmax_backward(grads_acts.logits, grads_acts.losses, acts.probs, model->targets, B, T, V, Vp);
+    // 最后一个 matmul 是没有 bias的  这里传了一个 NULL
     matmul_backward(grads_acts.lnf, grads.wte, NULL, grads_acts.logits, acts.lnf, params.wte, B, T, C, Vp);
     float* residual = acts.residual3 + (L-1) * B * T * C; // last layer's residual
     float* dresidual = grads_acts.residual3 + (L-1) * B * T * C; // write to last layer's residual
@@ -1066,7 +1121,7 @@ void gpt2_backward(GPT2 *model) {
 
 void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, float eps, float weight_decay, int t) {
     // reference: https://pytorch.org/docs/stable/generated/torch.optim.AdamW.html
-
+    /// 看这个  pytorch链接
     // lazily allocate the memory for m_memory and v_memory
     if (model->m_memory == NULL) {
         model->m_memory = (float*)calloc(model->num_parameters, sizeof(float));
@@ -1093,6 +1148,7 @@ void gpt2_update(GPT2 *model, float learning_rate, float beta1, float beta2, flo
 }
 
 void gpt2_free(GPT2 *model) {
+    // 释放所有申请的内存
     free(model->params_memory);
     free(model->grads_memory);
     free(model->m_memory);
@@ -1108,28 +1164,49 @@ void gpt2_free(GPT2 *model) {
 // ----------------------------------------------------------------------------
 // sampler
 
+// 定义一个函数random_u32，用于生成32位的随机无符号整数
+// 参数state是指向64位状态变量的指针，用于维护随机数生成过程中的状态
+// 返回值是一个32位的随机无符号整数
 unsigned int random_u32(uint64_t *state) {
-    // xorshift rng: https://en.wikipedia.org/wiki/Xorshift#xorshift.2A
+    // 使用xorshift算法进行随机数生成，这是一种快速且有效的随机数生成方法
+    // 第一步，将状态变量与自身右移12位的结果进行异或操作
     *state ^= *state >> 12;
+    // 第二步，将状态变量与自身左移25位的结果进行异或操作
     *state ^= *state << 25;
+    // 第三步，将状态变量与自身右移27位的结果进行异或操作
     *state ^= *state >> 27;
+    // 最后，将状态变量与一个固定的常数进行乘法操作，然后右移32位，得到最终的随机数
     return (*state * 0x2545F4914F6CDD1Dull) >> 32;
 }
-float random_f32(uint64_t *state) { // random float32 in [0,1)
+/**
+ * 生成一个范围在[0,1)内的随机浮点数
+ * @param state 指向随机数生成器的状态变量
+ * @return 返回一个范围在[0,1)内的随机浮点数
+ *
+ * 此函数通过调用random_u32函数生成一个无符号32位随机数，
+ * 然后右移8位，再除以2的24次方（即16777216.0f），
+ * 从而生成一个范围在[0,1)内的随机浮点数。
+ */
+float random_f32(uint64_t *state) {
     return (random_u32(state) >> 8) / 16777216.0f;
 }
 
+// 从概率数组中采样索引（它们的总和必须为1！）
+// coin是一个在[0, 1)范围内的随机数，通常来自random_f32()
 int sample_mult(float* probabilities, int n, float coin) {
-    // sample index from probabilities (they must sum to 1!)
-    // coin is a random number in [0, 1), usually from random_f32()
+    // 初始化累积分布函数变量
     float cdf = 0.0f;
+    // 遍历概率数组
     for (int i = 0; i < n; i++) {
+        // 累加当前索引的概率值到CDF
         cdf += probabilities[i];
+        // 如果coin小于当前的CDF值，则返回当前索引
         if (coin < cdf) {
             return i;
         }
     }
-    return n - 1; // in case of rounding errors
+    // 以防累积误差导致的边界情况，返回最后一个索引
+    return n - 1;
 }
 
 // ----------------------------------------------------------------------------
@@ -1138,6 +1215,7 @@ int main() {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
+    //加载模型
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
@@ -1149,6 +1227,8 @@ int main() {
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
     int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
     int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
+
+    // build the DataLoaders
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_tokens, B, T, 0, 1, 0);
